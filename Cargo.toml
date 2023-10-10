@@ -8,8 +8,11 @@ edition = "2021"
 [dependencies]
 axum = { version = "0.6.20", features = ["ws", "headers"] }
 tokio = { version = "1.0", features = ["full"] }
+maud = { version = "0.25", features = ["axum"] }
 futures = "0.3"
 serde_json = "1.0"
 fastrand = "2.0"
-maud = "0.25"
-serde = { version = "1.0.188", features = ["derive"] }
+arcstr = "1.1.5"
+
+[build-dependencies]
+ureq = "2.8.0"

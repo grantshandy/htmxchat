@@ -4,7 +4,10 @@ use std::{
 };
 
 use axum::{
-    extract::{ws::Message, ConnectInfo, State, WebSocketUpgrade},
+    extract::{
+        ws::{self, Message},
+        ConnectInfo, State, WebSocketUpgrade,
+    },
     http::Response,
     response::IntoResponse,
     routing::get,
@@ -12,158 +15,185 @@ use axum::{
 };
 use fastrand::Rng;
 use futures::{sink::SinkExt, stream::StreamExt};
-use maud::{html, PreEscaped, DOCTYPE};
-use tokio::sync::broadcast::{self, Receiver, Sender};
-
-const SERVER_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3030);
-const MSG_CHANNEL_BOUND: usize = 1000;
-
-const CSS: &str = r#"
-.app { width: 90vw; margin-left: auto; margin-right: auto; border: 1px solid black; }
-@media only screen and (min-width: 1076px) { .app { width: 40vw; } }
-#submitbox { padding: 0.5rem; display: flex; align-items: center; border-top: 1px solid black; }
-#submitform { flex-grow: 1; display: flex; height: 2rem; }
-ul { overflow-y: auto; height: 50vh; list-style-type: none; margin: 0; padding: 1rem; }
-li { margin-bottom: 0.5rem; }
-h1 { text-align: center; }"#;
-
-#[derive(serde::Deserialize)]
-struct ClientMessage {
-    pub msg: String,
-}
+use maud::{html, Markup, PreEscaped, Render, DOCTYPE};
+use serde_json::Value;
+use tokio::sync::{
+    broadcast::{self, Receiver, Sender},
+    Mutex,
+};
 
 #[tokio::main]
 async fn main() {
-    println!("starting server at http://{SERVER_ADDR}/");
+    let socket: SocketAddr = "127.0.0.1:3030".parse().unwrap();
 
-    axum::Server::bind(&SERVER_ADDR)
+    println!("starting server at http://{socket}/");
+
+    axum::Server::bind(&socket)
         .serve(
             Router::new()
                 .route("/", get(root))
                 .route("/chat", get(chat))
-                .with_state(Arc::new(broadcast::channel::<Message>(MSG_CHANNEL_BOUND)))
+                .with_state(Arc::new(ClientPool::default()))
                 .into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await
         .unwrap();
 }
 
-async fn root() -> Response<String> {
-    Response::builder()
-        .header("Content-Type", "text/html")
-        .body(
-            html! {
-                (DOCTYPE)
-                html lang="en" {
-                    head {
-                        meta charset="UTF-8";
-                        meta name="viewport" content="width=device-width, initial-scale=1.0";
-                        script { (PreEscaped(include_str!("htmx.min.js"))) };
-                        style { (CSS) }
-                        title { "htmXchat" }
-                    }
-                    body {
-                        h1 { "htmXchat" }
-                        .app {
-                            ul #messages {};
-                            #submitbox hx-ws="connect:/chat" {};
-                        }
+async fn root() -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="UTF-8";
+                meta name="viewport" content="width=device-width, initial-scale=1.0";
+                script { (PreEscaped(include_str!("../assets/htmx.min.js"))) };
+                style { (PreEscaped(include_str!(concat!(env!("OUT_DIR"), "/output.css")))) }
+                title { "htmXchat" }
+            }
+            body {
+                div class="w-5/6 md:w-1/2 mx-auto p-4 space-y-2" {
+                    h1 class="text-center text-2xl font-bold" { "htmXchat" }
+                    div class="border rounded-md p-2 space-y-2" {
+                        ul #messages class="border rounded-md" {};
+                        #messagebox class="flex items-center space-x-2 p-2 border rounded-md" hx-ws="connect:/chat" {};
                     }
                 }
             }
-            .into_string(),
-        )
-        .unwrap()
+        }
+    }
 }
+
+fn messagebox(addr: SocketAddr) -> Message {
+    Message::Text(html! {
+        div hx-swap-oob="innerHTML:#messagebox" {
+            form hx-ws="send:submit" class="flex-grow flex" {
+                input name="msg" type="text" placeholder="type your message!" autocomplete="off" class="flex-grow px-2" autofocus;
+                input type="submit" class="bg-blue-500 rounded-r-md text-white px-2";
+            }
+            span class="flex-grow" {
+                "You are " b style=(addr_to_css_color(addr)) { (addr) }
+            }
+        }
+    }.into_string())
+}
+
 
 async fn chat(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<Arc<(Sender<Message>, Receiver<Message>)>>,
+    State(client_pool): State<Arc<ClientPool>>,
 ) -> impl IntoResponse {
-    let client_tx = state.0.clone();
-
     ws.on_upgrade(move |mut socket| async move {
         if socket.send(Message::Ping(Vec::new())).await.is_err() {
-            println!("{addr} could not connect");
+            client_pool.send(addr, "<failed to connect>");
             return;
         }
 
         if socket.recv().await.map(|msg| msg.is_err()).unwrap_or(false) {
-            println!("client {addr} abruptly disconnected");
             return;
         }
 
-        let (mut tx, mut rx) = socket.split();
+        socket.send(messagebox(addr)).await.unwrap();
 
-        let recv_client_tx = client_tx.clone();
+        let (tx, mut rx) = socket.split();
+        let tx = Arc::new(Mutex::new(tx));
+
+        let client_pool_tx = client_pool.clone();
+        let mut submitbox_tx = tx.clone();
         let mut recv_task = tokio::spawn(async move {
             while let Some(Ok(msg)) = rx.next().await {
                 match msg {
-                    Message::Close(_) => break,
-                    Message::Text(json) => {
-                        if let Ok(ClientMessage { msg }) = serde_json::from_str(&json) {
-                            if msg.split_whitespace().collect::<String>().is_empty() {
-                                continue;
-                            }
+                    Message::Text(text) => {
+                        let msg = serde_json::from_str::<Value>(text.as_str()).unwrap_or_default()
+                            ["msg"]
+                            .to_string();
+                        let mut chars = msg.chars();
+                        chars.next();
+                        chars.next_back();
 
-                            push_chat_msg(&recv_client_tx, &format!("> {msg}"), addr);
+                        let text: String = chars.collect();
+
+                        if !text.is_empty() {
+                            client_pool_tx.send(addr, &text);
+                            submitbox_tx.lock().await.send(messagebox(addr)).await.unwrap();
                         }
                     }
+                    Message::Close(_) => break,
                     _ => (),
                 }
             }
         });
 
-        let mut client_rx = client_tx.clone().subscribe();
+        let mut client_pool_rx = client_pool.clone().subscribe();
         let mut send_task = tokio::spawn(async move {
-            while let Ok(msg) = client_rx.recv().await {
-                tx.send(msg).await.unwrap();
+            while let Ok(msg) = client_pool_rx.recv().await {
+                tx.lock().await.send(msg).await.unwrap();
             }
         });
 
-        push_chat_msg(&client_tx, " joined.", addr);
+        client_pool.send(addr, "<JOINED>");
 
         tokio::select! {
             _ = (&mut send_task) => recv_task.abort(),
             _ = (&mut recv_task) => send_task.abort(),
         }
 
-        push_chat_msg(&client_tx, " left.", addr);
+        client_pool.send(addr, "<LEFT>");
     })
 }
 
-fn push_chat_msg(client_tx: &Sender<Message>, msg: &str, addr: SocketAddr) {
-    let mut rng = Rng::with_seed(
-        match addr.ip() {
-            IpAddr::V4(ip) => ip.octets().iter().map(|o| *o as u64).sum::<u64>(),
-            IpAddr::V6(ip) => ip.octets().iter().map(|o| *o as u64).sum::<u64>(),
-        } + (addr.port() as u64),
-    );
-
-    let user_color = format!("rgb({},{},{})", rng.u8(..200), rng.u8(..200), rng.u8(..200));
-
-    client_tx
-        .send(Message::Text(html! {
-            div hx-swap-oob="beforeend:#messages" {
-                li {
-                    b style={ "color:" (user_color) } { (addr) }
-                    (PreEscaped(msg))
-                }
-            }
-            div hx-swap-oob="innerHTML:#submitbox" {
-                form #submitform hx-ws="send:submit" {
-                    input name="msg" type="text" placeholder="type your message!" autocomplete="off" style="flex-grow: 1;" autofocus;
-                    input type="submit";
-                }
-                span style="margin-left: 2rem;" {
-                    "You are "
-                    b style={ "color:" (user_color) } { (addr)}
-                }
-            }
-        }.into_string()))
-        .unwrap();
+struct ClientPool {
+    tx: Sender<Message>,
+    _rx: Receiver<Message>,
 }
 
-// only 46 SLOC!
-// this is the only file, all HTML is generated through a JSX-like template engine
+impl Default for ClientPool {
+    fn default() -> Self {
+        let (tx, _rx) = broadcast::channel(1000);
+
+        Self { tx, _rx }
+    }
+}
+
+impl ClientPool {
+    pub fn send(&self, user: SocketAddr, message: &str) {
+        let color = addr_to_css_color(user);
+
+        self.tx
+            .send(Message::Text(
+                html! {
+                    div hx-swap-oob="beforeend:#messages" {
+                        li style=(color) { (user) "> " (message) }
+                    }
+                }
+                .into_string(),
+            ))
+            .unwrap();
+
+        println!("{user}> {message}");
+    }
+
+    pub fn subscribe(&self) -> Receiver<Message> {
+        self.tx.subscribe()
+    }
+}
+
+fn addr_to_css_color(addr: SocketAddr) -> String {
+    let mut rng = Rng::with_seed(
+        addr.ip()
+            .to_string()
+            .as_bytes()
+            .iter()
+            .map(|o| *o as u64)
+            .sum::<u64>()
+            + (addr.port() as u64),
+    );
+
+    format!(
+        "color: rgb({},{},{});",
+        rng.u8(..200),
+        rng.u8(..200),
+        rng.u8(..200)
+    )
+}
