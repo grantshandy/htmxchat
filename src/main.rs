@@ -1,30 +1,31 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
-    extract::{
-        ws::{self, Message},
-        ConnectInfo, State, WebSocketUpgrade,
-    },
-    http::Response,
+    extract::{ws::Message, ConnectInfo, State, WebSocketUpgrade},
     response::IntoResponse,
     routing::get,
     Router,
 };
 use fastrand::Rng;
 use futures::{sink::SinkExt, stream::StreamExt};
-use maud::{html, Markup, PreEscaped, Render, DOCTYPE};
+use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde_json::Value;
 use tokio::sync::{
     broadcast::{self, Receiver, Sender},
     Mutex,
 };
 
+#[derive(argh::FromArgs)]
+/// A simple chat application to demonstrate the MATH stack :)
+struct Args {
+    /// what socket to serve on.
+    #[argh(positional, default = "\"127.0.0.1:3030\".parse().unwrap()")]
+    socket: SocketAddr,
+}
+
 #[tokio::main]
 async fn main() {
-    let socket: SocketAddr = "127.0.0.1:3030".parse().unwrap();
+    let socket: SocketAddr = argh::from_env::<Args>().socket;
 
     println!("starting server at http://{socket}/");
 
@@ -54,7 +55,7 @@ async fn root() -> Markup {
             body {
                 div class="w-5/6 md:w-1/2 mx-auto p-4 space-y-2" {
                     h1 class="text-center text-2xl font-bold" { "htmXchat" }
-                    div class="border rounded-md p-2 space-y-2" {
+                    div class="border-2 border-slate-600 rounded-md p-2 space-y-2" {
                         ul #messages class="border rounded-md" {};
                         #messagebox class="flex items-center space-x-2 p-2 border rounded-md" hx-ws="connect:/chat" {};
                     }
@@ -78,7 +79,6 @@ fn messagebox(addr: SocketAddr) -> Message {
     }.into_string())
 }
 
-
 async fn chat(
     ws: WebSocketUpgrade,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -100,7 +100,7 @@ async fn chat(
         let tx = Arc::new(Mutex::new(tx));
 
         let client_pool_tx = client_pool.clone();
-        let mut submitbox_tx = tx.clone();
+        let submitbox_tx = tx.clone();
         let mut recv_task = tokio::spawn(async move {
             while let Some(Ok(msg)) = rx.next().await {
                 match msg {
@@ -116,7 +116,12 @@ async fn chat(
 
                         if !text.is_empty() {
                             client_pool_tx.send(addr, &text);
-                            submitbox_tx.lock().await.send(messagebox(addr)).await.unwrap();
+                            submitbox_tx
+                                .lock()
+                                .await
+                                .send(messagebox(addr))
+                                .await
+                                .unwrap();
                         }
                     }
                     Message::Close(_) => break,
