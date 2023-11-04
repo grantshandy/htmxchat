@@ -18,7 +18,7 @@ use tokio::sync::{
 #[derive(argh::FromArgs)]
 /// A simple chat application to demonstrate the MATH stack :)
 struct Args {
-    /// what socket to serve on.
+    /// what socket to serve on
     #[argh(positional, default = "\"127.0.0.1:3030\".parse().unwrap()")]
     socket: SocketAddr,
 }
@@ -48,7 +48,7 @@ async fn root() -> Markup {
             head {
                 meta charset="UTF-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
-                script { (PreEscaped(include_str!("../assets/htmx.min.js"))) };
+                script { (PreEscaped(include_str!(env!("HTMX_OUT_PATH")))) };
                 style { (PreEscaped(include_str!(concat!(env!("OUT_DIR"), "/output.css")))) }
                 title { "htmXchat" }
             }
